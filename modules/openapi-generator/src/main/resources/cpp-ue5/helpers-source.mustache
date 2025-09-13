@@ -1,0 +1,307 @@
+{{>licenseInfo}}
+#include "{{modelNamePrefix}}Helpers.h"
+
+#include "{{unrealModuleName}}Module.h"
+
+#include "Interfaces/IHttpRequest.h"
+#include "PlatformHttp.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+
+{{#cppNamespaceDeclarations}}
+namespace {{this}}
+{
+{{/cppNamespaceDeclarations}}
+
+HttpFileInput::HttpFileInput(const TCHAR* InFilePath)
+{
+	SetFilePath(InFilePath);
+}
+
+HttpFileInput::HttpFileInput(const FString& InFilePath)
+{
+	SetFilePath(InFilePath);
+}
+
+void HttpFileInput::SetFilePath(const TCHAR* InFilePath)
+{
+	FilePath = InFilePath;
+	if(ContentType.IsEmpty())
+	{
+		ContentType = FPlatformHttp::GetMimeType(InFilePath);
+	}
+}
+
+void HttpFileInput::SetFilePath(const FString& InFilePath)
+{
+	SetFilePath(*InFilePath);
+}
+
+void HttpFileInput::SetContentType(const TCHAR* InContentType)
+{
+	ContentType = InContentType;
+}
+
+FString HttpFileInput::GetFilename() const
+{
+	return FPaths::GetCleanFilename(FilePath);
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+const TCHAR* HttpMultipartFormData::Delimiter = TEXT("--");
+const TCHAR* HttpMultipartFormData::Newline = TEXT("\r\n");
+
+void HttpMultipartFormData::SetBoundary(const TCHAR* InBoundary)
+{
+	checkf(Boundary.IsEmpty(), TEXT("Boundary must be set before usage"));
+	Boundary = InBoundary;
+}
+
+const FString& HttpMultipartFormData::GetBoundary() const
+{
+	if (Boundary.IsEmpty())
+	{
+		// Generate a random boundary with enough entropy, should avoid occurrences of the boundary in the data.
+		// Since the boundary is generated at every request, in case of failure, retries should succeed.
+		Boundary = FGuid::NewGuid().ToString(EGuidFormats::Short);
+	}
+
+	return Boundary;
+}
+
+void HttpMultipartFormData::SetupHttpRequest(const FHttpRequestRef& HttpRequest)
+{
+	if(HttpRequest->GetVerb() != TEXT("POST"))
+	{
+		UE_LOG(Log{{unrealModuleName}}, Error, TEXT("Expected POST verb when using multipart form data"));
+	}
+
+	// Append final boundary
+	AppendString(Delimiter);
+	AppendString(*GetBoundary());
+	AppendString(Delimiter);
+
+	HttpRequest->SetHeader("Content-Type", FString::Printf(TEXT("multipart/form-data; boundary=%s"), *GetBoundary()));
+	HttpRequest->SetContent(FormData);
+}
+
+void HttpMultipartFormData::AddStringPart(const TCHAR* Name, const TCHAR* Data)
+{
+	// Add boundary
+	AppendString(Delimiter);
+	AppendString(*GetBoundary());
+	AppendString(Newline);
+
+	// Add header
+	AppendString(*FString::Printf(TEXT("Content-Disposition: form-data; name = \"%s\""), Name));
+	AppendString(Newline);
+	AppendString(*FString::Printf(TEXT("Content-Type: text/plain; charset=utf-8")));
+	AppendString(Newline);
+
+	// Add header to body splitter
+	AppendString(Newline);
+
+	// Add Data
+	AppendString(Data);
+	AppendString(Newline);
+}
+
+void HttpMultipartFormData::AddJsonPart(const TCHAR* Name, const FString& JsonString)
+{
+	// Add boundary
+	AppendString(Delimiter);
+	AppendString(*GetBoundary());
+	AppendString(Newline);
+
+	// Add header
+	AppendString(*FString::Printf(TEXT("Content-Disposition: form-data; name=\"%s\""), Name));
+	AppendString(Newline);
+	AppendString(*FString::Printf(TEXT("Content-Type: application/json; charset=utf-8")));
+	AppendString(Newline);
+
+	// Add header to body splitter
+	AppendString(Newline);
+
+	// Add Data
+	AppendString(*JsonString);
+	AppendString(Newline);
+}
+
+void HttpMultipartFormData::AddBinaryPart(const TCHAR* Name, const TArray<uint8>& ByteArray)
+{
+	// Add boundary
+	AppendString(Delimiter);
+	AppendString(*GetBoundary());
+	AppendString(Newline);
+
+	// Add header
+	AppendString(*FString::Printf(TEXT("Content-Disposition: form-data; name=\"%s\""), Name));
+	AppendString(Newline);
+	AppendString(*FString::Printf(TEXT("Content-Type: application/octet-stream")));
+	AppendString(Newline);
+
+	// Add header to body splitter
+	AppendString(Newline);
+
+	// Add Data
+	FormData.Append(ByteArray);
+	AppendString(Newline);
+}
+
+void HttpMultipartFormData::AddFilePart(const TCHAR* Name, const HttpFileInput& File)
+{
+	TArray<uint8> FileContents;
+	if (!FFileHelper::LoadFileToArray(FileContents, *File.GetFilePath()))
+	{
+		UE_LOG(Log{{unrealModuleName}}, Error, TEXT("Failed to load file (%s)"), *File.GetFilePath());
+		return;
+	}
+
+	// Add boundary
+	AppendString(Delimiter);
+	AppendString(*GetBoundary());
+	AppendString(Newline);
+
+	// Add header
+	AppendString(*FString::Printf(TEXT("Content-Disposition: form-data; name=\"%s\"; filename=\"%s\""), Name, *File.GetFilename()));
+	AppendString(Newline);
+	AppendString(*FString::Printf(TEXT("Content-Type: %s"), *File.GetContentType()));
+	AppendString(Newline);
+
+	// Add header to body splitter
+	AppendString(Newline);
+
+	// Add Data
+	FormData.Append(FileContents);
+	AppendString(Newline);
+}
+
+void HttpMultipartFormData::AppendString(const TCHAR* Str)
+{
+	FTCHARToUTF8 utf8Str(Str);
+	FormData.Append((uint8*)utf8Str.Get(), utf8Str.Length());
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+bool ParseDateTime(const FString& DateTimeString, FDateTime& OutDateTime)
+{
+	// Iso8601 Format: 	DateTime: YYYY-mm-ddTHH:MM:SS(.sss)(Z|+hh:mm|+hhmm|-hh:mm|-hhmm)
+	{
+		// We cannot call directly FDateTime::ParseIso8601 because it does not allow for precision beyond the millisecond, but DateTimeString might have more digits
+		int32 DotIndex;
+		FString StringToParse = DateTimeString;
+		if (DateTimeString.FindChar('.', DotIndex))
+		{
+			int32 TimeZoneIndex;
+			if (DateTimeString.FindChar('Z', TimeZoneIndex) || DateTimeString.FindChar('+', TimeZoneIndex) || DateTimeString.FindChar('-', TimeZoneIndex))
+			{
+				// The string contains a time zone designator starting at TimeZoneIndex
+				if (TimeZoneIndex > DotIndex + 4)
+				{
+					// Trim to millisecond
+					StringToParse = DateTimeString.Left(DotIndex + 4) + DateTimeString.RightChop(TimeZoneIndex);
+				}
+			}
+			else
+			{
+				// the string does not contain a time zone designator, trim it to the millisecond
+				StringToParse = DateTimeString.Left(DotIndex + 4);
+			}
+		}
+
+		if (FDateTime::ParseIso8601(*StringToParse, OutDateTime))
+			return true;
+	}
+
+	if (FDateTime::ParseHttpDate(DateTimeString, OutDateTime))
+		return true;
+
+	return FDateTime::Parse(DateTimeString, OutDateTime);
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+FString PreprocessJsonForInt64Fields(const FString& JsonString, const TArray<FString>& Int64FieldPaths)
+{
+	if (Int64FieldPaths.Num() == 0)
+	{
+		return JsonString;
+	}
+
+	FString ProcessedJson = JsonString;
+	
+	// For each int64 field path, find and quote its numeric value
+	for (const FString& FieldPath : Int64FieldPaths)
+	{
+		// Build a regex pattern to match the field and its numeric value
+		// This pattern matches: "fieldname" : 1234567890123456789
+		// And captures the number to wrap it in quotes
+		FString Pattern = FString::Printf(TEXT(R"(("%s"\s*:\s*)(-?\d{15,}))"), *FieldPath);
+		
+		// Find all occurrences of this pattern
+		int32 SearchStart = 0;
+		while (SearchStart < ProcessedJson.Len())
+		{
+			int32 FieldIndex = ProcessedJson.Find(FString::Printf(TEXT("\"%s\""), *FieldPath), ESearchCase::IgnoreCase, ESearchDir::FromStart, SearchStart);
+			if (FieldIndex == INDEX_NONE)
+			{
+				break;
+			}
+			
+			// Find the colon after the field name
+			int32 ColonIndex = ProcessedJson.Find(TEXT(":"), ESearchCase::IgnoreCase, ESearchDir::FromStart, FieldIndex);
+			if (ColonIndex == INDEX_NONE)
+			{
+				SearchStart = FieldIndex + 1;
+				continue;
+			}
+			
+			// Skip whitespace after colon
+			int32 ValueStart = ColonIndex + 1;
+			while (ValueStart < ProcessedJson.Len() && FChar::IsWhitespace(ProcessedJson[ValueStart]))
+			{
+				ValueStart++;
+			}
+			
+			// Check if the value is a number (not already quoted)
+			if (ValueStart < ProcessedJson.Len() && ProcessedJson[ValueStart] != '"' && 
+			    (FChar::IsDigit(ProcessedJson[ValueStart]) || ProcessedJson[ValueStart] == '-'))
+			{
+				// Find the end of the number
+				int32 ValueEnd = ValueStart + 1;
+				while (ValueEnd < ProcessedJson.Len() && FChar::IsDigit(ProcessedJson[ValueEnd]))
+				{
+					ValueEnd++;
+				}
+				
+				// Extract the number
+				FString NumberStr = ProcessedJson.Mid(ValueStart, ValueEnd - ValueStart);
+				
+				// Only quote if it's a large number (15+ digits) that could lose precision
+				if (NumberStr.Len() >= 15)
+				{
+					// Replace the number with quoted version
+					FString QuotedNumber = FString::Printf(TEXT("\"%s\""), *NumberStr);
+					ProcessedJson = ProcessedJson.Left(ValueStart) + QuotedNumber + ProcessedJson.Mid(ValueEnd);
+					SearchStart = ValueStart + QuotedNumber.Len();
+				}
+				else
+				{
+					SearchStart = ValueEnd;
+				}
+			}
+			else
+			{
+				SearchStart = ValueStart + 1;
+			}
+		}
+	}
+	
+	return ProcessedJson;
+}
+
+{{#cppNamespaceDeclarations}}
+}
+{{/cppNamespaceDeclarations}}
